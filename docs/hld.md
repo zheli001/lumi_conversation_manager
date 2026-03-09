@@ -4,6 +4,8 @@
 **Version:** 1.0.0-RC  
 **Companion Documents:** [PRD / White Paper](whitepaper.md) · [Detailed Design](ddd.md)
 
+![HLD Architecture](../media/hld_architecture.svg)
+
 ---
 
 ## Table of Contents

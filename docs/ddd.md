@@ -4,6 +4,8 @@
 **Version:** 1.0.0-RC  
 **Companion Documents:** [PRD / White Paper](whitepaper.md) · [High Level Design](hld.md)
 
+![DDD Design Overview](../media/ddd_design_overview.svg)
+
 ---
 
 ## Table of Contents

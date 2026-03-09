@@ -5,6 +5,8 @@
 [![Status](https://img.shields.io/badge/status-RFC-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](../README.md)
 
+![Whitepaper Overview](../media/whitepaper_overview.svg)
+
 **Document Type:** White Paper / Product Requirements Document (PRD)  
 **Author:** Jeff Li — HAC-Flow Multi-Stakeholder Review Committee  
 **Date:** 2026-03-09  
