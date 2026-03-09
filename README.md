@@ -32,6 +32,21 @@ lumi-conversation-manager/
 └─ tmp/             # Temporary working files (not tracked in git)
 ```
 
+## Licensing
+
+| Component | License |
+|-----------|---------|
+| `brain/`, `interface/`, `examples/` | [GNU AGPL v3.0](LICENSE) |
+| Entire codebase (AI training prohibition) | [PolyForm No AI License 1.0.0](LICENSE-NoAI) |
+| `modules/official/` (binary/WASM) | Proprietary — see module manifest |
+
+## Disclaimer
+
+> **⚠ Unverified modules may be unsafe. The project maintainers accept no
+> responsibility for damage caused by running unverified or third-party modules.**
+
+See [DISCLAIMER.md](DISCLAIMER.md) for full details.
+
 ## Contributing
 
 PRs are accepted only for: `brain/`, `interface/`, `examples/`, `docs/`
