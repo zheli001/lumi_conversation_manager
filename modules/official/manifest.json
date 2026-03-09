@@ -1,0 +1,9 @@
+{
+  "name": "conversation-capability",
+  "version": "1.0.0",
+  "publisher": "lumi-conversation-manager",
+  "permissions": [
+    "filesystem.read",
+    "network.http"
+  ]
+}

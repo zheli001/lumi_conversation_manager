@@ -1,0 +1,19 @@
+name: Binary Verification
+
+on: [push, pull_request]
+
+jobs:
+  verify-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Verify module signatures
+        run: |
+          for f in modules/official/*.wasm; do
+            [ -f "$f" ] && ./tools/verify_sig "$f"
+          done
+      - name: Run modules in sandbox
+        run: |
+          for f in modules/official/*.wasm; do
+            [ -f "$f" ] && ./tools/sandbox_run "$f" --test
+          done
