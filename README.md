@@ -197,6 +197,8 @@ lumi-conversation-manager/
 | [White Paper](docs/whitepaper.md) | Problem statement, HAC-Flow algorithm, stakeholder value |
 | [High-Level Design](docs/hld.md) | Architecture, Shadow-Buffer design, SPI framework |
 | [Domain Design (DDD)](docs/ddd.md) | Java class design, SPI contracts, test standards |
+| [Evaluation Plan](docs/evaluation_plan.md) | HAC-Flow-based evaluation methodology, benchmarks, and success criteria |
+| [Comparison Results](docs/comparison_results.md) | Multi-dimensional comparison with LangChain4j, Spring AI, LangChain, and Semantic Kernel |
 | [Implementation Plan](tmp/implementation_plan.md) | Phase-by-phase build roadmap |
 
 ---
