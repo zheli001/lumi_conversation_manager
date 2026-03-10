@@ -17,4 +17,4 @@ build/
 Thumbs.db
 
 # AI assistant files
-agents_ext.md
+tmp/archive/agents_ext.md
