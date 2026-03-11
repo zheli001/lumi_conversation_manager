@@ -172,40 +172,94 @@ public class SessionSnapshot implements Serializable {
 ### 1.5 Conversation
 
 ```java
-package com.lumi.conversation.model;
-
-import java.time.Instant;
-import java.util.List;
-import java.util.Map;
-
 /**
- * Immutable snapshot of a conversation session returned by ConversationManager operations.
- * Contains the managed (compressed/evicted) message list that is safe to send to an LLM.
+ * A live, mutable handle to a managed conversation session.
+ * Obtained from {@link ConversationManager#getConversation(String)}.
  *
- * <p>Threading: Conversation objects are immutable — safe to share across threads.
+ * <p>All mutating operations return {@code this} for chaining.
+ * Implementations must be thread-safe.
  */
-public record Conversation(
-    String sessionId,                      // Unique session identifier
-    List<ChatMessage> messages,            // Managed context (compressed if over budget)
-    int tokenCount,                        // Current token count of messages
-    int tokenBudget,                       // Configured max tokens for this session
-    Map<String, TaskState> taskStates,     // Active/evicted task states
-    Instant createdAt,                     // When the session was first created
-    Instant updatedAt,                     // When the session was last modified
-    boolean persisted                      // true if ChatStorage SPI is configured
-) {
-    /** Returns true if the session is over 80% of its token budget */
-    public boolean isApproachingLimit() {
-        return tokenBudget > 0 && (double) tokenCount / tokenBudget >= 0.8;
+public interface Conversation {
+
+    /** The session identifier used to create or retrieve this conversation. */
+    String sessionId();
+
+    // ── Core Operations ──────────────────────────────────────────────────────
+
+    /**
+     * Adds a message to this conversation and returns {@code this} for chaining.
+     * The token budget is enforced asynchronously via Shadow-Buffer — this method
+     * never blocks on compression.
+     *
+     * @param message the message to add; sequenceId is assigned by the engine
+     * @return this Conversation (for chaining)
+     */
+    Conversation addMessage(ChatMessage message);
+
+    /**
+     * Returns the current managed context — the compressed/evicted message list
+     * safe to pass directly to an LLM.
+     */
+    List<ChatMessage> messages();
+
+    // ── Metadata ─────────────────────────────────────────────────────────────
+
+    int tokenCount();
+    int tokenBudget();
+    Map<String, TaskState> taskStates();
+    Instant createdAt();
+    Instant updatedAt();
+
+    /** Returns true if a ChatStorage SPI is configured and this session is persisted. */
+    boolean isPersisted();
+
+    /** Returns true if the session is over 80% of its token budget. */
+    default boolean isApproachingLimit() {
+        return tokenBudget() > 0 && (double) tokenCount() / tokenBudget() >= 0.8;
     }
 
-    /** Returns messages filtered to only active (non-evicted) task messages */
-    public List<ChatMessage> activeMessages() {
-        return messages.stream()
+    /** Returns only messages belonging to active (non-evicted) tasks. */
+    default List<ChatMessage> activeMessages() {
+        return messages().stream()
             .filter(m -> m.taskId() == null ||
-                taskStates.getOrDefault(m.taskId(), TaskState.ACTIVE) == TaskState.ACTIVE)
+                taskStates().getOrDefault(m.taskId(), TaskState.ACTIVE) == TaskState.ACTIVE)
             .toList();
     }
+
+    // ── Task Management ───────────────────────────────────────────────────────
+
+    /**
+     * Signals that a task is complete. Lumi will summarize and evict the task's
+     * messages from the active context, freeing token budget.
+     *
+     * @return this Conversation (for chaining)
+     */
+    Conversation markTaskComplete(String taskId);
+
+    // ── Checkpoint & Rollback ─────────────────────────────────────────────────
+
+    /** Saves a named checkpoint of the current state. Returns {@code this}. */
+    Conversation createCheckpoint(String label);
+
+    /** Restores the conversation to a previously saved checkpoint. Returns {@code this}. */
+    Conversation restoreCheckpoint(String checkpointId);
+
+    /** Rolls back to a prior sequenceId. Returns {@code this}. */
+    Conversation rollback(long targetSeqId);
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    /**
+     * Explicitly persists the current state via the ChatStorage SPI.
+     * No-op if no storage SPI is configured. Returns {@code this}.
+     */
+    Conversation persist();
+
+    /**
+     * Reloads this session from ChatStorage into memory.
+     * No-op if no storage SPI is configured. Returns {@code this}.
+     */
+    Conversation reload();
 }
 ```
 
@@ -966,23 +1020,17 @@ If `rollback()` is called while `state == MERGING` (i.e. Delta Patch is being wr
 ```java
 package com.lumi.conversation.api;
 
-import com.lumi.conversation.model.ChatMessage;
 import com.lumi.conversation.model.Conversation;
 import java.util.List;
 
 /**
  * Primary entry point for Lumi Conversation Manager.
  *
- * <p>A single ConversationManager instance manages multiple named sessions.
- * Sessions are identified by a caller-supplied {@code sessionId} (e.g., user ID,
- * request ID, or UUID). Sessions are auto-created on the first {@code addMessage()} call.
+ * <p>Acts as a factory and registry for {@link Conversation} handles.
+ * A single {@code ConversationManager} instance manages any number of named sessions.
+ * Sessions are identified by a caller-supplied {@code sessionId}.
  *
- * <p>Threading: All methods are thread-safe. Concurrent calls for different session IDs
- * are fully independent. Concurrent calls for the same session ID are serialised
- * per-session using StampedLock — addMessage() is lock-free for reads.
- *
- * <p>Persistence: Optional. If a {@link ChatStorage} SPI is configured, conversations
- * are persisted automatically. Without storage, sessions exist only in-memory.
+ * <p>Threading: All methods are thread-safe.
  *
  * <h2>Basic usage:</h2>
  * <pre>{@code
@@ -992,56 +1040,39 @@ import java.util.List;
  *     .storage(new JdbcChatStorage(dataSource))   // optional persistence
  *     .build();
  *
- * // Add a message — session "user-42" auto-created on first call
- * Conversation conv = manager.addMessage("user-42", ChatMessage.text("user", "Hello!"));
- *
- * // Get the current managed context
+ * // Get or create a Conversation — factory pattern
  * Conversation conv = manager.getConversation("user-42");
  *
- * // Pass context to your LLM
+ * // All operations are on the Conversation handle
+ * conv.addMessage(ChatMessage.text("user", "Hello!"))
+ *     .addMessage(ChatMessage.text("assistant", "Hi there!"));
+ *
+ * // Pass managed context to your LLM
  * llmClient.chat(conv.messages());
+ *
+ * // Later — retrieve the same session handle
+ * Conversation same = manager.getConversation("user-42");
  * }</pre>
  */
 public interface ConversationManager {
 
-    // ── Core Operations ──────────────────────────────────────────────────────
+    // ── Factory ───────────────────────────────────────────────────────────────
 
     /**
-     * Adds a message to the specified session and returns the updated Conversation.
-     * If the session does not exist, it is created automatically.
+     * Returns the {@link Conversation} for the given session, creating it if it
+     * does not yet exist. This is the primary entry point for all conversation work.
      *
-     * <p>Token budget enforcement runs asynchronously via Shadow-Buffer — this method
-     * always returns immediately without waiting for compression.
+     * <p>If a {@link ChatStorage} SPI is configured and the session exists in storage
+     * but not in memory, it is transparently loaded from storage.
      *
      * @param sessionId caller-supplied session identifier; must not be null or blank
-     * @param message   the message to add; sequenceId is assigned by the engine
-     * @return the updated Conversation reflecting the new message
-     * @throws IllegalArgumentException if sessionId is null/blank or message is null
-     */
-    Conversation addMessage(String sessionId, ChatMessage message);
-
-    /**
-     * Retrieves the current managed Conversation for the specified session.
-     * Returns the compressed/evicted view — safe to send directly to an LLM.
-     *
-     * @param sessionId the session to retrieve
-     * @return the current Conversation state
-     * @throws SessionNotFoundException if no session with the given ID exists
+     * @return the Conversation handle for the session (never null)
      */
     Conversation getConversation(String sessionId);
 
     // ── Session Lifecycle ─────────────────────────────────────────────────────
 
-    /**
-     * Explicitly creates a new session. Optional — sessions are also
-     * auto-created by addMessage(). Use this to pre-configure a session.
-     *
-     * @return the newly created (empty) Conversation
-     * @throws SessionAlreadyExistsException if the session already exists
-     */
-    Conversation createSession(String sessionId);
-
-    /** Returns true if a session with the given ID exists (in-memory or persisted). */
+    /** Returns true if a session with the given ID exists (in-memory or in storage). */
     boolean sessionExists(String sessionId);
 
     /** Returns the IDs of all active (in-memory) sessions. */
@@ -1049,49 +1080,9 @@ public interface ConversationManager {
 
     /**
      * Deletes a session and all its in-memory state.
-     * If persistence is configured, persisted data is NOT deleted (use storage SPI directly).
+     * Persisted data in ChatStorage is NOT deleted — use the storage SPI directly.
      */
     void deleteSession(String sessionId);
-
-    // ── Task Management ───────────────────────────────────────────────────────
-
-    /**
-     * Signals that a task is complete. Lumi will summarize the task's messages
-     * and evict them from the active context, freeing token budget.
-     *
-     * @return the updated Conversation after eviction is queued
-     */
-    Conversation markTaskComplete(String sessionId, String taskId);
-
-    // ── Persistence ───────────────────────────────────────────────────────────
-
-    /**
-     * Explicitly persists the current session state via the ChatStorage SPI.
-     * No-op if no storage SPI is configured.
-     *
-     * @return the Conversation with persisted=true
-     */
-    Conversation persistConversation(String sessionId);
-
-    /**
-     * Loads a previously persisted session from ChatStorage into memory.
-     * If the session is already in memory, refreshes it from storage.
-     *
-     * @return the loaded Conversation
-     * @throws StorageException if storage is not configured or load fails
-     */
-    Conversation loadConversation(String sessionId);
-
-    // ── Checkpoint & Rollback ─────────────────────────────────────────────────
-
-    /** Saves a named checkpoint of the session's current state. Returns the Conversation. */
-    Conversation createCheckpoint(String sessionId, String label);
-
-    /** Restores the session to a previously saved checkpoint. Returns the restored Conversation. */
-    Conversation restoreCheckpoint(String sessionId, String checkpointId);
-
-    /** Rolls back the session to a prior sequenceId. Returns the rolled-back Conversation. */
-    Conversation rollback(String sessionId, long targetSeqId);
 
     // ── Builder ───────────────────────────────────────────────────────────────
 

@@ -58,7 +58,7 @@ Lumi's **Shadow-Buffer architecture** decouples live message writes from compres
 
 ```mermaid
 graph TD
-    App[Your Application] -->|addMessage / getContext| API[ConversationManager API]
+    App[Your Application] -->|getConversation / addMessage| API[ConversationManager API]
     API --> Engine[MemoryFunnelEngine]
     Engine --> Primary[Primary Buffer - live messages]
     Engine --> Shadow[Shadow Buffer - async compression]
@@ -101,7 +101,7 @@ dependencies {
 
 ### Basic usage
 
-`ConversationManager` is a **multi-session manager** — one instance handles all your users' conversations. Sessions are identified by any `String` ID and auto-created on first use.
+`ConversationManager` is a **factory** — one instance handles all your users' conversations. Call `getConversation(id)` to create or retrieve a `Conversation` handle, then operate on it directly.
 
 ```java
 // 1. Build once — share as a singleton across your application
@@ -112,19 +112,18 @@ ConversationManager manager = ConversationManager.builder()
     .sanitizer(new PiiSanitizer())                    // optional: strip PII
     .build();
 
-// 2. Add messages — session "user-42" is auto-created on first call
-Conversation conv = manager.addMessage("user-42",
-    ChatMessage.text("user", "Help me refactor this Java class."));
-
-conv = manager.addMessage("user-42",
-    ChatMessage.text("assistant", "Sure! Here is the refactored version..."));
-
-// 3. Retrieve the managed context — always within token budget, safe to send to LLM
+// 2. Get or create a Conversation handle — auto-created on first call
 Conversation conv = manager.getConversation("user-42");
+
+// 3. Add messages directly on the Conversation — chainable
+conv.addMessage(ChatMessage.text("user", "Help me refactor this Java class."))
+    .addMessage(ChatMessage.text("assistant", "Sure! Here is the refactored version..."));
+
+// 4. Pass managed context to your LLM — always within token budget
 String llmResponse = openAiClient.chat(conv.messages());
 
-// 4. When a task is done — Lumi summarizes and evicts it to free token budget
-conv = manager.markTaskComplete("user-42", "refactor-task");
+// 5. When a task is done — Lumi summarizes and evicts it to free token budget
+conv.markTaskComplete("refactor-task");
 
 // Each session is fully independent — concurrent users never contend
 Conversation alice = manager.getConversation("user-alice");
