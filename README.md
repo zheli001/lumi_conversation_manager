@@ -68,8 +68,8 @@ graph TD
     end
 
     subgraph "Integration Layer (choose one)"
-        MCP["🔌 MCP Server\nlumi-mcp-server\n(coming soon)"]
-        REST["🌐 REST API\n(coming soon)"]
+        Skills["⭐ CLI + Skills\nSystem prompt / function schemas\n+ lumi-cli\n(lightest, no server)"]
+        MCP["🔌 MCP Server\nlumi-mcp-server\n(planned — needs sidecar)"]
         Lib["📦 Java Library\n(available now)"]
     end
 
@@ -79,16 +79,17 @@ graph TD
         Buffer[Shadow-Buffer / HAC-Flow]
     end
 
-    CLI & CC & Codex & IDE -->|"MCP tool calls\n(store/get messages)"| MCP
+    CLI & CC & Codex & IDE -->|"CLI + Skills\n(system prompt / function schemas)"| Skills
+    CLI & CC & Codex & IDE -->|"MCP tool calls"| MCP
+    Skills --> API
     MCP --> API
-    REST --> API
     Lib --> API
     API --> Engine --> Buffer
     Buffer -->|managed context| LLM["Your LLM\n(OpenAI / Anthropic / etc.)"]
     Buffer --> Storage["ChatStorage SPI\n(optional persistence)"]
 ```
 
-> **Note:** MCP Server and REST API are planned integrations — see [Integration Paths](#-integration-paths). Direct Java library usage is available today.
+> **Note:** CLI + Skills (no server) is the lightest AI-native path — available once `lumi-cli` ships. MCP Server is planned for tools that support MCP natively. Direct Java library usage is available today.
 
 ### Lumi's internal components
 
@@ -203,15 +204,16 @@ ConversationManager manager = ConversationManager.builder()
 
 ## 🔗 Integration Paths
 
-There are three emerging standards for AI-native tool integration. Lumi provides connectors for all of them:
+**How LLM tool calling works** (important context before choosing a path):
 
-| Protocol | Scope | Lumi connector |
-|---|---|---|
-| **MCP** (Model Context Protocol) | Agent ↔ Tools — universal, cross-host | MCP Server (planned) |
-| **OpenAI function calling** | LLM API ↔ Tools — in-band, all major APIs | Function schemas (planned) |
-| **Google A2A** | Agent ↔ Agent — multi-agent orchestration | Future |
+When an LLM "calls a skill", it doesn't execute anything directly. The flow is always:
+1. LLM outputs: *"I want to call `store_message` with sessionId=X, role=user, content=Y"*
+2. The **host** (your application, Claude Code, an agent framework) intercepts the tool call
+3. Host executes the backing action (CLI command, library call, etc.)
+4. Result is returned to the LLM as the tool result
+5. LLM continues reasoning with the updated context
 
-> 💡 **MCP is the recommended connector.** It is the de-facto common standard supported by Claude Code, GitHub Copilot, Cursor, Semantic Kernel, and more. Implement once — works with all MCP-compatible hosts automatically.
+So there are always **two things to configure on the LLM side**: (a) skill definitions so the LLM knows what tools exist, and (b) the host must have a tool-execution loop that actually runs them. Lumi minimises both.
 
 ---
 
@@ -233,19 +235,62 @@ conv.addMessage(ChatMessage.text("assistant", response));
 
 ---
 
-### 🔌 MCP Server — Planned (Universal AI-Native Connector)
+### 🖥️ CLI + Skills — Planned ⭐ Lightest AI-Native Path
 
-> **Status: Planned.** One MCP server → every MCP-compatible AI tool works with Lumi automatically.
+> **Status: Planned.** No server required. Just `lumi-cli` installed — the AI tool handles execution.
 
-**MCP (Model Context Protocol)** is the "USB-C for AI tools" — an open JSON-RPC standard for agent-to-tool connectivity. By running Lumi as an MCP server, all supported tools get Lumi conversation management with a single config block. No per-tool integration code needed.
+This is the lightest "AI-native" integration. Lumi ships **skill definitions** (system prompt snippets + function schemas) that tell an LLM how to call `lumi-cli` commands. The host AI tool — which already has a bash/shell execution capability (e.g., Claude Code's bash tool, agent frameworks) — runs the CLI. No MCP server, no extra process.
 
-**Setup:**
-```bash
-# 1. Start the Lumi MCP server
-java -jar lumi-mcp-server.jar
+**What Lumi provides out of the box:**
+- `lumi-skills.md` — system prompt snippet describing Lumi skills (for chat-based tools)
+- `lumi-skills-openai.json` — function schemas for OpenAI-compatible API calls
+- `lumi-skills-anthropic.json` — tool_use schemas for Anthropic API calls
 
-# 2. Add to your AI tool config — example for Claude Code:
+**How the LLM uses it (end-to-end example):**
 ```
+1. User asks: "Help me refactor this class"
+
+2. LLM calls store_message skill:
+   → host runs: lumi msg add session-1 --role user --content "Help me refactor..."
+   ← lumi returns: { "sessionId": "session-1", "tokenCount": 120, "messages": [...] }
+
+3. LLM calls get_context skill:
+   → host runs: lumi context get session-1
+   ← lumi returns: managed message list (compressed, within token budget)
+
+4. LLM sends context to LLM API → generates response
+
+5. LLM calls store_message again with assistant reply:
+   → host runs: lumi msg add session-1 --role assistant --content "Here is..."
+```
+
+**What needs to be configured on the LLM/host side:**
+| If using... | Configuration needed |
+|---|---|
+| Claude Code (has bash tool) | Add `lumi-skills.md` to system prompt; install `lumi-cli` |
+| OpenAI API (custom agent) | Register `lumi-skills-openai.json` as tools in API call; write tool-execution loop that runs CLI |
+| Anthropic API (custom agent) | Register `lumi-skills-anthropic.json`; write tool-execution loop |
+| LangChain / other framework | Wrap lumi-cli calls as LangChain tools; load skill definitions |
+
+**Skills included:**
+
+| Skill | CLI backing | Description |
+|---|---|---|
+| `store_message` | `lumi msg add` | Add a user or assistant turn |
+| `get_context` | `lumi context get` | Get managed context (token-budgeted) |
+| `mark_task_complete` | `lumi task complete` | Signal task done → evict context |
+| `rollback` | `lumi rollback` | Roll back to prior state |
+| `create_checkpoint` | `lumi checkpoint save` | Snapshot session |
+| `restore_checkpoint` | `lumi checkpoint restore` | Restore snapshot |
+
+---
+
+### 🔌 MCP Server — Planned
+
+> **Status: Planned.** Requires `lumi-mcp-server` running as a sidecar. Useful when the AI tool supports MCP natively and you don't want to write a tool-execution loop.
+
+MCP-compatible hosts (Claude Code, GitHub Copilot, Cursor) handle the tool-execution loop automatically. The trade-off vs. CLI+Skills: one extra process to start, but zero code on the host side.
+
 ```json
 {
   "mcpServers": {
@@ -258,50 +303,13 @@ java -jar lumi-mcp-server.jar
 }
 ```
 
-**MCP tools exposed** (callable by any MCP host): `store_message`, `get_context`, `mark_task_complete`, `rollback`, `create_checkpoint`, `restore_checkpoint`, `list_sessions`
-
-**Compatible hosts (one server covers all):**
-
-| AI Tool | Status |
-|---|---|
-| Claude Code | 🔲 Planned |
-| GitHub Copilot (VS Code) | 🔲 Planned |
-| Cursor | 🔲 Planned |
-| Claude Desktop | 🔲 Planned |
-| Any MCP-compatible host | 🔲 Planned |
-
----
-
-### 🧠 OpenAI-Compatible Function Schemas — Planned
-
-> **Status: Planned.** One schema set → works with OpenAI, Anthropic, Gemini, Llama, Cohere, and any OpenAI-compatible API.
-
-Generate Lumi's skills as function calling schemas and embed them in your LLM system prompt or function registry:
-
-```bash
-lumi install-skills --target openai     # → lumi-skills-openai.json
-lumi install-skills --target anthropic  # → lumi-skills-anthropic.json
-```
-
-Your LLM can then call Lumi skills natively during its reasoning loop — backed by `lumi-cli` as the execution engine. No API calls from your own code.
-
----
-
-### 🖥️ CLI — Planned
-
-> **Status: Planned.** Script conversation workflows from any shell or language.
-
-```bash
-lumi session get user-42
-lumi msg add user-42 --role user --content "Explain this stack trace"
-lumi context get user-42 | curl -X POST https://api.openai.com/v1/chat/completions ...
-```
+Compatible hosts: Claude Code, GitHub Copilot (VS Code), Cursor, Claude Desktop.
 
 ---
 
 ### 🤖 Google A2A — Future
 
-**A2A (Agent-to-Agent Protocol)** is Google's standard for multi-agent collaboration — agents discovering, delegating to, and orchestrating each other. Complementary to MCP (MCP = agent-to-tool vertical; A2A = agent-to-agent horizontal). Relevant for future Lumi multi-agent scenarios. Tracked in [brainstorms.md](tmp/brainstorms.md).
+**A2A (Agent-to-Agent Protocol)** is Google's standard for multi-agent collaboration — complementary to MCP (MCP = agent-to-tool; A2A = agent-to-agent). Relevant for future multi-agent Lumi scenarios. Tracked in [brainstorms.md](tmp/brainstorms.md).
 
 ---
 
