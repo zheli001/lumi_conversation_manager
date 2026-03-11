@@ -101,31 +101,34 @@ dependencies {
 
 ### Basic usage
 
-```java
-// 1. Implement the Summarizer SPI for your LLM provider
-Summarizer summarizer = messages -> {
-    // Call your LLM API (OpenAI, Claude, etc.)
-    return openAiClient.summarize(messages);
-};
+`ConversationManager` is a **multi-session manager** — one instance handles all your users' conversations. Sessions are identified by any `String` ID and auto-created on first use.
 
-// 2. Build the ConversationManager
+```java
+// 1. Build once — share as a singleton across your application
 ConversationManager manager = ConversationManager.builder()
     .tokenBudget(4096)
-    .summarizer(summarizer)
-    .storage(new InMemoryStorage())      // or RedisStorage, JdbcStorage
-    .sanitizer(new PiiSanitizer())       // optional: strip PII before storage
+    .summarizer(new OpenAiSummarizer(openAiClient))  // your LLM for compression
+    .storage(new JdbcChatStorage(dataSource))         // optional: persist conversations
+    .sanitizer(new PiiSanitizer())                    // optional: strip PII
     .build();
 
-// 3. Use it in your application
-manager.addMessage(Role.USER, "Help me refactor this Java class.");
-manager.addMessage(Role.ASSISTANT, "Sure! Here is the refactored version...");
+// 2. Add messages — session "user-42" is auto-created on first call
+Conversation conv = manager.addMessage("user-42",
+    ChatMessage.text("user", "Help me refactor this Java class."));
 
-// When a task is complete, mark it — Lumi will summarize and evict it
-manager.markTaskComplete("refactor-task");
+conv = manager.addMessage("user-42",
+    ChatMessage.text("assistant", "Sure! Here is the refactored version..."));
 
-// Get the current context to send to your LLM (always within token budget)
-List<ChatMessage> context = manager.getContext();
-String llmResponse = openAiClient.chat(context);
+// 3. Retrieve the managed context — always within token budget, safe to send to LLM
+Conversation conv = manager.getConversation("user-42");
+String llmResponse = openAiClient.chat(conv.messages());
+
+// 4. When a task is done — Lumi summarizes and evicts it to free token budget
+conv = manager.markTaskComplete("user-42", "refactor-task");
+
+// Each session is fully independent — concurrent users never contend
+Conversation alice = manager.getConversation("user-alice");
+Conversation bob   = manager.getConversation("user-bob");
 ```
 
 ---
@@ -154,9 +157,10 @@ public class MyOpenAiSummarizer implements Summarizer {
     }
 }
 
-// Register it when building the manager
+// Register it when building the manager — one manager, all sessions
 ConversationManager manager = ConversationManager.builder()
     .summarizer(new MyOpenAiSummarizer(openAiClient))
+    .tokenBudget(8192)
     .build();
 ```
 

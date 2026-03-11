@@ -1,4 +1,4 @@
-# MemoryFunnel — Detailed Design Document (DDD)
+# Lumi Conversation Manager — Detailed Design Document (DDD)
 
 **Document Type:** Detailed Design Document (DDD)  
 **Version:** 1.0.0-RC  
@@ -10,6 +10,7 @@
 
 ## Table of Contents
 - [1. Data Model Design](#1-data-model-design)
+  - [1.5 Conversation](#15-conversation)
 - [2. SPI Interface Specifications](#2-spi-interface-specifications)
 - [3. Core Engine — MemoryFunnelEngine](#3-core-engine--memoryfunnelengine)
 - [4. Shadow-Buffer Implementation — SessionContext](#4-shadow-buffer-implementation--sessioncontext)
@@ -165,6 +166,46 @@ public class SessionSnapshot implements Serializable {
 
     public String getContentHash() { return contentHash; }
     // ... other getters
+}
+```
+
+### 1.5 Conversation
+
+```java
+package com.lumi.conversation.model;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Immutable snapshot of a conversation session returned by ConversationManager operations.
+ * Contains the managed (compressed/evicted) message list that is safe to send to an LLM.
+ *
+ * <p>Threading: Conversation objects are immutable — safe to share across threads.
+ */
+public record Conversation(
+    String sessionId,                      // Unique session identifier
+    List<ChatMessage> messages,            // Managed context (compressed if over budget)
+    int tokenCount,                        // Current token count of messages
+    int tokenBudget,                       // Configured max tokens for this session
+    Map<String, TaskState> taskStates,     // Active/evicted task states
+    Instant createdAt,                     // When the session was first created
+    Instant updatedAt,                     // When the session was last modified
+    boolean persisted                      // true if ChatStorage SPI is configured
+) {
+    /** Returns true if the session is over 80% of its token budget */
+    public boolean isApproachingLimit() {
+        return tokenBudget > 0 && (double) tokenCount / tokenBudget >= 0.8;
+    }
+
+    /** Returns messages filtered to only active (non-evicted) task messages */
+    public List<ChatMessage> activeMessages() {
+        return messages.stream()
+            .filter(m -> m.taskId() == null ||
+                taskStates.getOrDefault(m.taskId(), TaskState.ACTIVE) == TaskState.ACTIVE)
+            .toList();
+    }
 }
 ```
 
@@ -338,6 +379,8 @@ public interface MetricsProvider {
 ---
 
 ## 3. Core Engine — MemoryFunnelEngine
+
+> **Multi-session architecture**: `ConversationManager` maintains one `MemoryFunnelEngine` per session in a `ConcurrentHashMap<String, MemoryFunnelEngine>`. Each engine instance is fully independent — concurrent operations on different sessions never contend. Concurrent operations on the same session are coordinated by the per-session `StampedLock` already designed into `SessionContext`.
 
 ```java
 package com.lumi.conversation.engine;
@@ -921,19 +964,154 @@ If `rollback()` is called while `state == MERGING` (i.e. Delta Patch is being wr
 ## 12. Builder & Configuration API
 
 ```java
-ConversationManager manager = ConversationManager.builder()
-    .sessionId("user-123-session-456")
-    .maxTokenBudget(8192)                              // max tokens for LLM context
-    .withStorage(new RedisStorage(jedisPool))
-    .withTokenCounter(new TiktokenCounter(Encoding.CL100K_BASE))
-    .withRetentionPolicy(new SlidingWindowRetentionPolicy())
-    .withSummarizer(new OpenAISummarizer(openAiClient))
-    .withSanitizer(new RegexSanitizer(PII_PATTERNS))   // user provides PII regex rules
-    .withEncryptor(new AesEncryptor(secretKey))
-    .withMetrics(new PrometheusMetricsProvider(registry))
-    .withExecutor(Executors.newCachedThreadPool())      // Java 17
-    // .withExecutor(Executors.newVirtualThreadPerTaskExecutor()) // Java 21
-    .build();
+package com.lumi.conversation.api;
+
+import com.lumi.conversation.model.ChatMessage;
+import com.lumi.conversation.model.Conversation;
+import java.util.List;
+
+/**
+ * Primary entry point for Lumi Conversation Manager.
+ *
+ * <p>A single ConversationManager instance manages multiple named sessions.
+ * Sessions are identified by a caller-supplied {@code sessionId} (e.g., user ID,
+ * request ID, or UUID). Sessions are auto-created on the first {@code addMessage()} call.
+ *
+ * <p>Threading: All methods are thread-safe. Concurrent calls for different session IDs
+ * are fully independent. Concurrent calls for the same session ID are serialised
+ * per-session using StampedLock — addMessage() is lock-free for reads.
+ *
+ * <p>Persistence: Optional. If a {@link ChatStorage} SPI is configured, conversations
+ * are persisted automatically. Without storage, sessions exist only in-memory.
+ *
+ * <h2>Basic usage:</h2>
+ * <pre>{@code
+ * ConversationManager manager = ConversationManager.builder()
+ *     .tokenBudget(4096)
+ *     .summarizer(new OpenAiSummarizer(openAiClient))
+ *     .storage(new JdbcChatStorage(dataSource))   // optional persistence
+ *     .build();
+ *
+ * // Add a message — session "user-42" auto-created on first call
+ * Conversation conv = manager.addMessage("user-42", ChatMessage.text("user", "Hello!"));
+ *
+ * // Get the current managed context
+ * Conversation conv = manager.getConversation("user-42");
+ *
+ * // Pass context to your LLM
+ * llmClient.chat(conv.messages());
+ * }</pre>
+ */
+public interface ConversationManager {
+
+    // ── Core Operations ──────────────────────────────────────────────────────
+
+    /**
+     * Adds a message to the specified session and returns the updated Conversation.
+     * If the session does not exist, it is created automatically.
+     *
+     * <p>Token budget enforcement runs asynchronously via Shadow-Buffer — this method
+     * always returns immediately without waiting for compression.
+     *
+     * @param sessionId caller-supplied session identifier; must not be null or blank
+     * @param message   the message to add; sequenceId is assigned by the engine
+     * @return the updated Conversation reflecting the new message
+     * @throws IllegalArgumentException if sessionId is null/blank or message is null
+     */
+    Conversation addMessage(String sessionId, ChatMessage message);
+
+    /**
+     * Retrieves the current managed Conversation for the specified session.
+     * Returns the compressed/evicted view — safe to send directly to an LLM.
+     *
+     * @param sessionId the session to retrieve
+     * @return the current Conversation state
+     * @throws SessionNotFoundException if no session with the given ID exists
+     */
+    Conversation getConversation(String sessionId);
+
+    // ── Session Lifecycle ─────────────────────────────────────────────────────
+
+    /**
+     * Explicitly creates a new session. Optional — sessions are also
+     * auto-created by addMessage(). Use this to pre-configure a session.
+     *
+     * @return the newly created (empty) Conversation
+     * @throws SessionAlreadyExistsException if the session already exists
+     */
+    Conversation createSession(String sessionId);
+
+    /** Returns true if a session with the given ID exists (in-memory or persisted). */
+    boolean sessionExists(String sessionId);
+
+    /** Returns the IDs of all active (in-memory) sessions. */
+    List<String> listSessions();
+
+    /**
+     * Deletes a session and all its in-memory state.
+     * If persistence is configured, persisted data is NOT deleted (use storage SPI directly).
+     */
+    void deleteSession(String sessionId);
+
+    // ── Task Management ───────────────────────────────────────────────────────
+
+    /**
+     * Signals that a task is complete. Lumi will summarize the task's messages
+     * and evict them from the active context, freeing token budget.
+     *
+     * @return the updated Conversation after eviction is queued
+     */
+    Conversation markTaskComplete(String sessionId, String taskId);
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    /**
+     * Explicitly persists the current session state via the ChatStorage SPI.
+     * No-op if no storage SPI is configured.
+     *
+     * @return the Conversation with persisted=true
+     */
+    Conversation persistConversation(String sessionId);
+
+    /**
+     * Loads a previously persisted session from ChatStorage into memory.
+     * If the session is already in memory, refreshes it from storage.
+     *
+     * @return the loaded Conversation
+     * @throws StorageException if storage is not configured or load fails
+     */
+    Conversation loadConversation(String sessionId);
+
+    // ── Checkpoint & Rollback ─────────────────────────────────────────────────
+
+    /** Saves a named checkpoint of the session's current state. Returns the Conversation. */
+    Conversation createCheckpoint(String sessionId, String label);
+
+    /** Restores the session to a previously saved checkpoint. Returns the restored Conversation. */
+    Conversation restoreCheckpoint(String sessionId, String checkpointId);
+
+    /** Rolls back the session to a prior sequenceId. Returns the rolled-back Conversation. */
+    Conversation rollback(String sessionId, long targetSeqId);
+
+    // ── Builder ───────────────────────────────────────────────────────────────
+
+    static Builder builder() {
+        return new ConversationManagerBuilder();
+    }
+
+    interface Builder {
+        Builder tokenBudget(int maxTokens);
+        Builder summarizer(Summarizer summarizer);
+        Builder storage(ChatStorage storage);           // optional — enables persistence
+        Builder tokenCounter(TokenCounter counter);
+        Builder sanitizer(Sanitizer sanitizer);
+        Builder retentionPolicy(RetentionPolicy policy);
+        Builder encryptor(Encryptor encryptor);
+        Builder metricsProvider(MetricsProvider metrics);
+        Builder executorFactory(ExecutorFactory factory);
+        ConversationManager build();
+    }
+}
 ```
 
 ---
