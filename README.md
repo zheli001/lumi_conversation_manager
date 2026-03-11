@@ -56,9 +56,45 @@ Lumi's **Shadow-Buffer architecture** decouples live message writes from compres
 
 ## 🏛️ Architecture Overview
 
+### Where Lumi fits in the ecosystem
+
 ```mermaid
 graph TD
-    App[Your Application] -->|getConversation / addMessage| API[ConversationManager API]
+    subgraph "End-User AI Tools"
+        CLI["GitHub Copilot CLI"]
+        CC["Claude Code"]
+        Codex["Codex / OpenAI CLI"]
+        IDE["Copilot in IDE"]
+    end
+
+    subgraph "Integration Layer (choose one)"
+        MCP["🔌 MCP Server\nlumi-mcp-server\n(coming soon)"]
+        REST["🌐 REST API\n(coming soon)"]
+        Lib["📦 Java Library\n(available now)"]
+    end
+
+    subgraph "Lumi Core"
+        API[ConversationManager]
+        Engine[MemoryFunnelEngine]
+        Buffer[Shadow-Buffer / HAC-Flow]
+    end
+
+    CLI & CC & Codex & IDE -->|"MCP tool calls\n(store/get messages)"| MCP
+    MCP --> API
+    REST --> API
+    Lib --> API
+    API --> Engine --> Buffer
+    Buffer -->|managed context| LLM["Your LLM\n(OpenAI / Anthropic / etc.)"]
+    Buffer --> Storage["ChatStorage SPI\n(optional persistence)"]
+```
+
+> **Note:** MCP Server and REST API are planned integrations — see [Integration Paths](#-integration-paths). Direct Java library usage is available today.
+
+### Lumi's internal components
+
+```mermaid
+graph TD
+    App[Your Application] -->|getConversation / addMessage| API[ConversationManager]
     API --> Engine[MemoryFunnelEngine]
     Engine --> Primary[Primary Buffer - live messages]
     Engine --> Shadow[Shadow Buffer - async compression]
@@ -68,8 +104,6 @@ graph TD
     Broker --> Storage[ChatStorage SPI]
     Broker --> Summarizer[Summarizer SPI]
 ```
-
-**Core components:**
 
 - **`MemoryFunnelEngine`** — orchestrates buffer lifecycle and HAC-Flow compression passes
 - **`SessionContext`** — holds per-session state: messages, token counts, task boundaries
@@ -169,9 +203,63 @@ ConversationManager manager = ConversationManager.builder()
 
 ## 🔗 Integration Paths
 
-- **Java Library** — add the Gradle or Maven dependency shown above; zero configuration required beyond your SPIs
-- **MCP Server** — run `lumi-mcp-server.jar` as a sidecar process; Claude Code and GitHub Copilot connect automatically via the Model Context Protocol
-- **CLI** — script conversation workflows with `lumi session create`, `lumi msg add`, `lumi context get`
+### 📦 Java Library — Available Now
+
+Embed Lumi directly in any JVM application. Best for: **building your own AI coding assistant, chatbot, or agent framework**.
+
+```java
+ConversationManager manager = ConversationManager.builder()
+    .tokenBudget(4096)
+    .summarizer(new OpenAiSummarizer(client))
+    .build();
+
+Conversation conv = manager.getConversation(sessionId);
+conv.addMessage(ChatMessage.text("user", userInput));
+String response = llmClient.chat(conv.messages());
+conv.addMessage(ChatMessage.text("assistant", response));
+```
+
+### 🔌 MCP Server — Planned
+
+> **Status: Planned — not yet implemented. See [brainstorms.md](tmp/brainstorms.md) and Phase 5 of [implementation_plan.md](tmp/implementation_plan.md).**
+
+Run Lumi as a **Model Context Protocol (MCP) server** — a sidecar process that AI tools (Claude Code, GitHub Copilot, Codex CLI) connect to for conversation state management.
+
+**How it would work:**
+1. Start the Lumi MCP server: `java -jar lumi-mcp-server.jar --port 7424`
+2. Configure your AI tool to connect (e.g., add to `claude_desktop_config.json` or `.github/copilot-mcp.json`)
+3. The AI tool calls Lumi MCP tools during its conversation loop:
+   - `lumi.getConversation(sessionId)` — retrieve managed context
+   - `lumi.addMessage(sessionId, role, content)` — store a turn
+   - `lumi.markTaskComplete(sessionId, taskId)` — trigger context eviction
+4. Lumi returns the token-budgeted, compressed context — the AI tool sends it to the LLM
+
+**Target integrations (placeholders):**
+| Tool | Integration Method | Status |
+|---|---|---|
+| Claude Code | MCP (`claude_desktop_config.json`) | 🔲 Planned |
+| GitHub Copilot CLI | MCP or extension | 🔲 Planned |
+| Codex CLI | MCP or stdin/stdout | 🔲 Planned |
+| GitHub Copilot in IDE | Extension API | 🔲 Placeholder — approach TBD |
+| Custom AI agents | MCP or REST | 🔲 Planned |
+
+### 🖥️ CLI Tool — Planned
+
+> **Status: Planned — not yet implemented.**
+
+Script conversation workflows from any shell, language, or tool:
+
+```bash
+# Start or resume a session
+lumi session get user-42
+
+# Add a turn
+lumi msg add user-42 --role user --content "Explain this stack trace"
+lumi msg add user-42 --role assistant --content "The NullPointerException occurs at..."
+
+# Get the managed context (token-budgeted) — pipe to your LLM
+lumi context get user-42 | curl -X POST https://api.openai.com/v1/chat/completions ...
+```
 
 ---
 
